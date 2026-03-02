@@ -1,4 +1,4 @@
-# lock-callback
+# lock-notify
 
 An [`RwLock`] wrapper that fires callbacks when a write guard is released.
 
@@ -9,33 +9,21 @@ An [`RwLock`] wrapper that fires callbacks when a write guard is released.
 ## The solution
 
 ```rust
-use lock_callback::RwLockCallback;
+use lock_notify::RwLockNotify;
 
-let lock = RwLockCallback::new(0u32);
+let lock = RwLockNotify::new(0u32);
 
-// Holds the lock — any concurrent try_write will register a callback
+// Holds the lock — any concurrent try_write_or will register a callback
 let guard = lock.write();
 
 // Fails: lock is held. Callback is queued.
-lock.try_write(|| println!("lock is free now"));
+lock.try_write_or(|| println!("lock is free now"));
 
 // Dropping the guard fires all queued callbacks in FIFO order.
 drop(guard);
 ```
 
-When `try_write` fails, the callback is queued. When the write guard is dropped, every queued callback is called in FIFO order — without holding any lock.
-
-## API
-
-| Method | Returns | Description |
-|---|---|---|
-| `new(value)` | `Self` | Wraps a value in a new lock |
-| `from_lock(lock)` | `Self` | Wraps an existing `RwLock<T>` |
-| `try_write(callback)` | `Option<WriteGuard>` | Non-blocking; queues callback on contention |
-| `write()` | `WriteGuard` | Blocking; runs queued callbacks on drop |
-| `read()` | `ReadGuard` | Shared read, standard `RwLock` semantics |
-
-`RwLockCallbackWriteGuard` implements `Deref` and `DerefMut`.
+When `try_write_or` fails, the callback is queued. When the write guard is dropped, every queued callback is called in FIFO order — without holding any lock.
 
 ## Callback semantics
 
@@ -48,7 +36,7 @@ When `try_write` fails, the callback is queued. When the write guard is dropped,
 
 ```toml
 [dependencies]
-lock-callback = "0.1"
+lock-notify = "0.1"
 ```
 
 ## Use cases

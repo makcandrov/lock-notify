@@ -11,13 +11,13 @@ use std::{
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug)]
-pub struct RwLockCallback<T> {
+pub struct RwLockNotify<T> {
     lock: RwLock<T>,
     state: Arc<LockState>,
 }
 
 #[derive(Debug)]
-pub struct RwLockCallbackWriteGuard<'a, T> {
+pub struct RwLockNotifyWriteGuard<'a, T> {
     guard: Option<RwLockWriteGuard<'a, T>>,
     state: Arc<LockState>,
 }
@@ -55,37 +55,53 @@ impl Debug for LockState {
     }
 }
 
-impl<T> RwLockCallback<T> {
-    pub fn new_arc(value: T) -> Arc<Self> {
-        Arc::new(Self::new(value))
-    }
-
+impl<T> RwLockNotify<T> {
     pub fn new(value: T) -> Self {
-        Self::from_lock(RwLock::new(value))
+        Self::from_inner(RwLock::new(value))
     }
 
-    pub fn from_lock(lock: RwLock<T>) -> Self {
+    pub fn from_inner(lock: RwLock<T>) -> Self {
         Self {
             lock,
             state: Arc::new(LockState::default()),
         }
     }
 
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.lock.into_inner()
+    }
+
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         self.lock.read()
     }
 
-    pub fn write(&self) -> RwLockCallbackWriteGuard<'_, T> {
-        RwLockCallbackWriteGuard {
+    #[must_use]
+    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
+        self.lock.try_read()
+    }
+
+    #[must_use]
+    pub fn write(&self) -> RwLockNotifyWriteGuard<'_, T> {
+        RwLockNotifyWriteGuard {
             guard: Some(self.lock.write()),
             state: self.state.clone(),
         }
     }
 
-    pub fn try_write<'a>(
+    #[must_use]
+    pub fn try_write(&self) -> Option<RwLockNotifyWriteGuard<'_, T>> {
+        self.lock.try_write().map(|guard| RwLockNotifyWriteGuard {
+            guard: Some(guard),
+            state: self.state.clone(),
+        })
+    }
+
+    #[must_use]
+    pub fn try_write_or<'a>(
         &'a self,
         callback: impl FnOnce() + Send + 'static,
-    ) -> Option<RwLockCallbackWriteGuard<'a, T>> {
+    ) -> Option<RwLockNotifyWriteGuard<'a, T>> {
         // Atomically wait until not dropping, then increment locking.
         // Both steps happen under the same mutex, which eliminates the TOCTOU
         // that required SeqCst atomic ordering in the spin-based version.
@@ -102,7 +118,7 @@ impl<T> RwLockCallback<T> {
             if inner.locking == 0 {
                 self.state.locking_zero.notify_one();
             }
-            Some(RwLockCallbackWriteGuard {
+            Some(RwLockNotifyWriteGuard {
                 guard: Some(guard),
                 state: self.state.clone(),
             })
@@ -118,25 +134,25 @@ impl<T> RwLockCallback<T> {
     }
 }
 
-impl<T> From<T> for RwLockCallback<T> {
+impl<T> From<T> for RwLockNotify<T> {
     fn from(value: T) -> Self {
         Self::new(value)
     }
 }
 
-impl<T> From<RwLock<T>> for RwLockCallback<T> {
+impl<T> From<RwLock<T>> for RwLockNotify<T> {
     fn from(lock: RwLock<T>) -> Self {
-        Self::from_lock(lock)
+        Self::from_inner(lock)
     }
 }
 
-impl<'a, T> Drop for RwLockCallbackWriteGuard<'a, T> {
+impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
     fn drop(&mut self) {
         let callbacks = {
             let mut inner = self.state.inner.lock();
             inner.dropping = true;
-            // Sleep until all in-flight try_write calls have either registered
-            // their callback or obtained the lock.
+            // Sleep until all in-flight try_write_or calls have either
+            // registered their callback or obtained the lock.
             while inner.locking != 0 {
                 self.state.locking_zero.wait(&mut inner);
             }
@@ -158,7 +174,7 @@ impl<'a, T> Drop for RwLockCallbackWriteGuard<'a, T> {
     }
 }
 
-impl<'a, T> Deref for RwLockCallbackWriteGuard<'a, T> {
+impl<'a, T> Deref for RwLockNotifyWriteGuard<'a, T> {
     type Target = <RwLockWriteGuard<'a, T> as Deref>::Target;
 
     fn deref(&self) -> &Self::Target {
@@ -166,7 +182,7 @@ impl<'a, T> Deref for RwLockCallbackWriteGuard<'a, T> {
     }
 }
 
-impl<'a, T> DerefMut for RwLockCallbackWriteGuard<'a, T> {
+impl<'a, T> DerefMut for RwLockNotifyWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         DerefMut::deref_mut(self.guard.as_mut().unwrap())
     }

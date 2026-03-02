@@ -477,13 +477,10 @@ fn test_stress_many_writers_one_reader() {
             let sc = success_count.clone();
             let cc = callback_count.clone();
             s.spawn(move || {
-                match lock2.try_write_or(move || {
+                if lock2.try_write_or(move || {
                     cc.fetch_add(1, Relaxed);
-                }) {
-                    Some(_) => {
-                        sc.fetch_add(1, Relaxed);
-                    }
-                    None => {}
+                }).is_some() {
+                    sc.fetch_add(1, Relaxed);
                 }
             });
         }

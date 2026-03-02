@@ -24,6 +24,22 @@ pub struct RwLockNotify<T> {
     state: Arc<LockState>,
 }
 
+/// RAII read guard for [`RwLockNotify`].
+///
+/// Provides shared read access to the protected value via [`Deref`].
+/// When dropped, releases the read lock and, if this was the last active
+/// read guard, immediately flushes any pending callbacks that were registered
+/// via [`try_write_or`].
+///
+/// Obtained via [`RwLockNotify::read`] or [`RwLockNotify::try_read`].
+///
+/// [`try_write_or`]: RwLockNotify::try_write_or
+#[derive(Debug)]
+pub struct RwLockNotifyReadGuard<'a, T> {
+    guard: Option<RwLockReadGuard<'a, T>>,
+    state: Arc<LockState>,
+}
+
 /// RAII write guard for [`RwLockNotify`].
 ///
 /// Provides exclusive write access to the protected value via [`Deref`] and [`DerefMut`].
@@ -44,6 +60,8 @@ pub struct RwLockNotifyWriteGuard<'a, T> {
 struct Inner {
     dropping: bool,
     locking: u64,
+    /// Number of live [`RwLockNotifyReadGuard`] instances.
+    readers: u64,
     callbacks: Vec<Box<dyn FnOnce() + Send>>,
 }
 
@@ -97,18 +115,30 @@ impl<T> RwLockNotify<T> {
 
     /// Locks for shared read access, blocking until it can be acquired.
     ///
-    /// Note: dropping a read guard does **not** trigger callbacks. Callbacks are
-    /// only fired when a [`RwLockNotifyWriteGuard`] is dropped.
-    pub fn read(&self) -> RwLockReadGuard<'_, T> {
-        self.lock.read()
+    /// When the returned guard is dropped, any pending callbacks registered via
+    /// [`try_write_or`] are flushed if this was the last reader holding the lock.
+    ///
+    /// [`try_write_or`]: RwLockNotify::try_write_or
+    pub fn read(&self) -> RwLockNotifyReadGuard<'_, T> {
+        let guard = self.lock.read();
+        self.state.inner.lock().readers += 1;
+        RwLockNotifyReadGuard {
+            guard: Some(guard),
+            state: self.state.clone(),
+        }
     }
 
     /// Attempts to acquire shared read access without blocking.
     ///
     /// Returns `None` if a write lock is currently held.
     #[must_use]
-    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
-        self.lock.try_read()
+    pub fn try_read(&self) -> Option<RwLockNotifyReadGuard<'_, T>> {
+        let guard = self.lock.try_read()?;
+        self.state.inner.lock().readers += 1;
+        Some(RwLockNotifyReadGuard {
+            guard: Some(guard),
+            state: self.state.clone(),
+        })
     }
 
     /// Locks for exclusive write access, blocking until it can be acquired.
@@ -195,6 +225,65 @@ impl<T> From<RwLock<T>> for RwLockNotify<T> {
     }
 }
 
+/// Drops `write_guard` (releasing the exclusive lock), resets `dropping` to `false`,
+/// notifies waiters, then runs all collected callbacks, re-raising the first panic.
+///
+/// Callers must have already set `dropping = true` and drained the callback queue.
+fn drain_and_run<W>(
+    write_guard: W,
+    state: &Arc<LockState>,
+    callbacks: Vec<Box<dyn FnOnce() + Send>>,
+) {
+    drop(write_guard);
+
+    {
+        let mut inner = state.inner.lock();
+        inner.dropping = false;
+        state.not_dropping.notify_all();
+    }
+
+    // Run every callback regardless of panics, then re-raise the first
+    // panic (if any) after all callbacks have had a chance to execute.
+    // `catch_unwind` is called unconditionally before `or` so that every
+    // callback runs even if an earlier one panicked (`or_else` would
+    // short-circuit and skip the remaining callbacks).
+    let first_panic = callbacks.into_iter().fold(None, |first, callback| {
+        let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
+        first.or(result)
+    });
+
+    if let Some(payload) = first_panic {
+        panic::resume_unwind(payload);
+    }
+}
+
+impl<'a, T> Drop for RwLockNotifyReadGuard<'a, T> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+
+        let callbacks = {
+            let mut inner = self.state.inner.lock();
+            inner.readers -= 1;
+            // Only the last reader drains; also skip if a concurrent drain is
+            // already running (`dropping = true`) — it would create a deadlock
+            // because both sides would sleep on `locking_zero` but
+            // `notify_one` only wakes a single waiter.
+            if inner.readers > 0 || inner.callbacks.is_empty() || inner.dropping {
+                return;
+            }
+            inner.dropping = true;
+            while inner.locking != 0 {
+                self.state.locking_zero.wait(&mut inner);
+            }
+            take(&mut inner.callbacks)
+        };
+
+        // The read lock is already released; pass `()` so drain_and_run has
+        // nothing to drop before resetting `dropping` and running callbacks.
+        drain_and_run((), &self.state, callbacks);
+    }
+}
+
 impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
     fn drop(&mut self) {
         let callbacks = {
@@ -209,27 +298,15 @@ impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
             // Mutex released here — callbacks execute without holding any lock.
         };
 
-        drop(self.guard.take().unwrap());
+        drain_and_run(self.guard.take().unwrap(), &self.state, callbacks);
+    }
+}
 
-        {
-            let mut inner = self.state.inner.lock();
-            inner.dropping = false;
-            self.state.not_dropping.notify_all();
-        }
+impl<'a, T> Deref for RwLockNotifyReadGuard<'a, T> {
+    type Target = T;
 
-        // Run every callback regardless of panics, then re-raise the first
-        // panic (if any) after all callbacks have had a chance to execute.
-        // `catch_unwind` is called unconditionally before `or` so that every
-        // callback runs even if an earlier one panicked (`or_else` would
-        // short-circuit and skip the remaining callbacks).
-        let first_panic = callbacks.into_iter().fold(None, |first, callback| {
-            let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
-            first.or(result)
-        });
-
-        if let Some(payload) = first_panic {
-            panic::resume_unwind(payload);
-        }
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
     }
 }
 

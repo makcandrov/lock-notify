@@ -2,6 +2,12 @@
 name = "lock-callback"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/makcandrov/lock-callback"
+homepage = "https://github.com/makcandrov/lock-callback"
+description = "An `RwLock` wrapper that fires callbacks when a write guard is released."
+license = "MIT OR Apache-2.0"
+keywords = ["lock", "callback"]
 
 [dependencies]
 parking_lot = "0.12"

@@ -1,11 +1,14 @@
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![doc = include_str!("../README.md")]
+
 use std::{
-     fmt::Debug, hint::spin_loop, mem::take, sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering::{SeqCst, Release, Relaxed}},
-    }
+    fmt::Debug,
+    mem::take,
+    ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug)]
 pub struct RwLockCallback<T> {
@@ -20,24 +23,48 @@ pub struct RwLockCallbackWriteGuard<'a, T> {
 }
 
 #[derive(Default)]
+struct Inner {
+    dropping: bool,
+    locking: u64,
+    callbacks: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+#[derive(Default)]
 struct LockState {
-    locking: AtomicU64,
-    dropping: AtomicBool,
-    callbacks: RwLock<Vec<Box<dyn FnOnce() + Send + Sync>>>,
+    inner: Mutex<Inner>,
+    /// Notified when `locking` reaches zero (dropper is waiting on this).
+    locking_zero: Condvar,
+    /// Notified when `dropping` becomes false (try_write callers wait on this).
+    not_dropping: Condvar,
 }
 
 impl Debug for LockState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LockState")
-            .field("locking", &self.locking)
-            .field("dropping", &self.dropping)
-            .field("callbacks", &"{callbacks}")
-            .finish()
+        match self.inner.try_lock() {
+            Some(inner) => f
+                .debug_struct("LockState")
+                .field("dropping", &inner.dropping)
+                .field("locking", &inner.locking)
+                .field("callbacks", &"{callbacks}")
+                .finish(),
+            None => f
+                .debug_struct("LockState")
+                .field("inner", &"<locked>")
+                .finish(),
+        }
     }
 }
 
 impl<T> RwLockCallback<T> {
-    pub fn new(lock: RwLock<T>) -> Self {
+    pub fn new_arc(value: T) -> Arc<Self> {
+        Arc::new(Self::new(value))
+    }
+
+    pub fn new(value: T) -> Self {
+        Self::from_lock(RwLock::new(value))
+    }
+
+    pub fn from_lock(lock: RwLock<T>) -> Self {
         Self {
             lock,
             state: Arc::new(LockState::default()),
@@ -57,56 +84,90 @@ impl<T> RwLockCallback<T> {
 
     pub fn try_write<'a>(
         &'a self,
-        callback: impl FnOnce() + Send + Sync + 'static,
+        callback: impl FnOnce() + Send + 'static,
     ) -> Option<RwLockCallbackWriteGuard<'a, T>> {
-        loop {
-            self.state.locking.fetch_add(1, SeqCst);
-
-            if !self.state.dropping.load(SeqCst) {
-                break;
-            }
-
-            self.state.locking.fetch_sub(1, SeqCst);
-            while self.state.dropping.load(Relaxed) {
-                spin_loop();
-            }
+        // Atomically wait until not dropping, then increment locking.
+        // Both steps happen under the same mutex, which eliminates the TOCTOU
+        // that required SeqCst atomic ordering in the spin-based version.
+        let mut inner = self.state.inner.lock();
+        while inner.dropping {
+            self.state.not_dropping.wait(&mut inner);
         }
+        inner.locking += 1;
+        drop(inner);
 
         if let Some(guard) = self.lock.try_write() {
-            self.state.locking.fetch_sub(1, Release);
-
+            let mut inner = self.state.inner.lock();
+            inner.locking -= 1;
+            if inner.locking == 0 {
+                self.state.locking_zero.notify_one();
+            }
             Some(RwLockCallbackWriteGuard {
                 guard: Some(guard),
                 state: self.state.clone(),
             })
         } else {
-            self.state.callbacks.write().push(Box::new(callback));
-            self.state.locking.fetch_sub(1, Release);
+            let mut inner = self.state.inner.lock();
+            inner.callbacks.push(Box::new(callback));
+            inner.locking -= 1;
+            if inner.locking == 0 {
+                self.state.locking_zero.notify_one();
+            }
             None
         }
     }
 }
 
+impl<T> From<T> for RwLockCallback<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl<T> From<RwLock<T>> for RwLockCallback<T> {
+    fn from(lock: RwLock<T>) -> Self {
+        Self::from_lock(lock)
+    }
+}
+
 impl<'a, T> Drop for RwLockCallbackWriteGuard<'a, T> {
     fn drop(&mut self) {
-        self.state.dropping.store(true, SeqCst);
-        let guard = self.guard.take().unwrap();
-
-        let callbacks = loop {
-            let mut callbacks = self.state.callbacks.write();
-
-            if self.state.locking.load(SeqCst) == 0 {
-                break take(&mut *callbacks);
+        let callbacks = {
+            let mut inner = self.state.inner.lock();
+            inner.dropping = true;
+            // Sleep until all in-flight try_write calls have either registered
+            // their callback or obtained the lock.
+            while inner.locking != 0 {
+                self.state.locking_zero.wait(&mut inner);
             }
-
-            spin_loop();
+            take(&mut inner.callbacks)
+            // Mutex released here — callbacks execute without holding any lock.
         };
 
-        drop(guard);
-        self.state.dropping.store(false, Relaxed);
+        drop(self.guard.take().unwrap());
+
+        {
+            let mut inner = self.state.inner.lock();
+            inner.dropping = false;
+            self.state.not_dropping.notify_all();
+        }
 
         for callback in callbacks {
             callback()
         }
+    }
+}
+
+impl<'a, T> Deref for RwLockCallbackWriteGuard<'a, T> {
+    type Target = <RwLockWriteGuard<'a, T> as Deref>::Target;
+
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
+    }
+}
+
+impl<'a, T> DerefMut for RwLockCallbackWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        DerefMut::deref_mut(self.guard.as_mut().unwrap())
     }
 }

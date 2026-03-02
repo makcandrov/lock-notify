@@ -57,7 +57,6 @@ fn test_callback() {
     });
 }
 
-
 #[test]
 fn test_multiple_callbacks() {
     let lock = Arc::new(RwLockCallback::new(RwLock::new(0u64)));
@@ -76,14 +75,47 @@ fn test_multiple_callbacks() {
 
 #[test]
 fn test_callback_can_call_try_write() {
-    // Reproduces deadlock bug #1 if present
+    // Verifies that callbacks execute without holding any internal lock,
+    // so re-entering try_write from a callback does not deadlock.
     let lock = Arc::new(RwLockCallback::new(RwLock::new(0u64)));
     let lock2 = lock.clone();
 
     let guard = lock.try_write(|| {}).unwrap();
     lock.try_write(move || {
-        // Lock is free here — this must not deadlock
+        // Lock is free here — this must not deadlock.
         let _ = lock2.try_write(|| {});
     });
-    drop(guard); // would deadlock here with the current implementation
+    drop(guard);
+}
+
+#[test]
+fn test_read() {
+    let lock = RwLockCallback::new(42u64);
+    assert_eq!(*lock.read(), 42);
+}
+
+#[test]
+fn test_concurrent_reads() {
+    // Two read guards can be held simultaneously.
+    let lock = Arc::new(RwLockCallback::new(42u64));
+    let r1 = lock.read();
+    let r2 = lock.read();
+    assert_eq!(*r1, 42);
+    assert_eq!(*r2, 42);
+}
+
+#[test]
+fn test_write_triggers_callbacks() {
+    // write() (blocking) should run registered callbacks on drop, just like
+    // a guard obtained via try_write().
+    let lock = Arc::new(RwLockCallback::new(RwLock::new(0u64)));
+
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let guard = lock.write();
+    lock.try_write(move || called2.store(true, Relaxed));
+    drop(guard);
+
+    assert!(called.load(Relaxed));
 }

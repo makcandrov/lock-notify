@@ -5,17 +5,35 @@ use std::{
     fmt::Debug,
     mem::take,
     ops::{Deref, DerefMut},
+    panic::{self, AssertUnwindSafe},
     sync::Arc,
 };
 
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+/// An [`RwLock`] wrapper that fires registered callbacks when a write guard is released.
+///
+/// When [`try_write_or`] cannot acquire the lock, the provided callback is queued.
+/// All queued callbacks are called in FIFO order, without holding any lock, when the
+/// next write guard is dropped.
+///
+/// [`try_write_or`]: RwLockNotify::try_write_or
 #[derive(Debug)]
 pub struct RwLockNotify<T> {
     lock: RwLock<T>,
     state: Arc<LockState>,
 }
 
+/// RAII write guard for [`RwLockNotify`].
+///
+/// Provides exclusive write access to the protected value via [`Deref`] and [`DerefMut`].
+/// When dropped, releases the lock and calls all callbacks that were registered via
+/// [`try_write_or`] while this guard was held.
+///
+/// Obtained via [`RwLockNotify::write`], [`RwLockNotify::try_write`], or
+/// [`RwLockNotify::try_write_or`].
+///
+/// [`try_write_or`]: RwLockNotify::try_write_or
 #[derive(Debug)]
 pub struct RwLockNotifyWriteGuard<'a, T> {
     guard: Option<RwLockWriteGuard<'a, T>>,
@@ -56,10 +74,12 @@ impl Debug for LockState {
 }
 
 impl<T> RwLockNotify<T> {
+    /// Creates a new `RwLockNotify` wrapping `value`.
     pub fn new(value: T) -> Self {
         Self::from_inner(RwLock::new(value))
     }
 
+    /// Creates a new `RwLockNotify` from an existing [`RwLock`].
     pub fn from_inner(lock: RwLock<T>) -> Self {
         Self {
             lock,
@@ -67,20 +87,36 @@ impl<T> RwLockNotify<T> {
         }
     }
 
+    /// Consumes the lock and returns the inner value.
+    ///
+    /// Any callbacks pending in the queue are dropped without being called.
     #[must_use]
     pub fn into_inner(self) -> T {
         self.lock.into_inner()
     }
 
+    /// Locks for shared read access, blocking until it can be acquired.
+    ///
+    /// Note: dropping a read guard does **not** trigger callbacks. Callbacks are
+    /// only fired when a [`RwLockNotifyWriteGuard`] is dropped.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         self.lock.read()
     }
 
+    /// Attempts to acquire shared read access without blocking.
+    ///
+    /// Returns `None` if a write lock is currently held.
     #[must_use]
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         self.lock.try_read()
     }
 
+    /// Locks for exclusive write access, blocking until it can be acquired.
+    ///
+    /// Callbacks registered via [`try_write_or`] while this guard is held will be
+    /// called when the guard is dropped.
+    ///
+    /// [`try_write_or`]: RwLockNotify::try_write_or
     #[must_use]
     pub fn write(&self) -> RwLockNotifyWriteGuard<'_, T> {
         RwLockNotifyWriteGuard {
@@ -89,6 +125,12 @@ impl<T> RwLockNotify<T> {
         }
     }
 
+    /// Attempts to acquire exclusive write access without blocking.
+    ///
+    /// Returns `None` if the lock is currently held. No callback is registered on
+    /// failure; use [`try_write_or`] to register one.
+    ///
+    /// [`try_write_or`]: RwLockNotify::try_write_or
     #[must_use]
     pub fn try_write(&self) -> Option<RwLockNotifyWriteGuard<'_, T>> {
         self.lock.try_write().map(|guard| RwLockNotifyWriteGuard {
@@ -97,6 +139,13 @@ impl<T> RwLockNotify<T> {
         })
     }
 
+    /// Attempts to acquire exclusive write access without blocking.
+    ///
+    /// - **Success** — returns `Some(guard)` and discards `callback`.
+    /// - **Failure** — queues `callback` and returns `None`. The callback will be
+    ///   called, without holding any lock, after the next write guard is dropped.
+    ///
+    /// Callbacks are called in FIFO registration order.
     #[must_use]
     pub fn try_write_or<'a>(
         &'a self,
@@ -168,8 +217,18 @@ impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
             self.state.not_dropping.notify_all();
         }
 
-        for callback in callbacks {
-            callback()
+        // Run every callback regardless of panics, then re-raise the first
+        // panic (if any) after all callbacks have had a chance to execute.
+        // `catch_unwind` is called unconditionally before `or` so that every
+        // callback runs even if an earlier one panicked (`or_else` would
+        // short-circuit and skip the remaining callbacks).
+        let first_panic = callbacks.into_iter().fold(None, |first, callback| {
+            let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
+            first.or(result)
+        });
+
+        if let Some(payload) = first_panic {
+            panic::resume_unwind(payload);
         }
     }
 }

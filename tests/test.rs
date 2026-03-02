@@ -1,5 +1,6 @@
 use std::{
     hint::spin_loop,
+    panic::{self, AssertUnwindSafe},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
@@ -108,6 +109,27 @@ fn test_concurrent_reads() {
     let r2 = lock.read();
     assert_eq!(*r1, 42);
     assert_eq!(*r2, 42);
+}
+
+#[test]
+fn test_callback_panic_does_not_skip_subsequent() {
+    // A panicking callback must not prevent later callbacks from running.
+    // The panic is re-raised after all callbacks complete.
+    let lock = Arc::new(RwLockNotify::new(0u64));
+
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let guard = lock.write();
+    let _ = lock.try_write_or(|| panic!("intentional panic in callback"));
+    let _ = lock.try_write_or(move || called2.store(true, Relaxed));
+
+    // The drop re-raises the panic from the first callback.
+    let result = panic::catch_unwind(AssertUnwindSafe(|| drop(guard)));
+    assert!(result.is_err(), "panic should have been re-raised");
+
+    // But the second callback still ran.
+    assert!(called.load(Relaxed));
 }
 
 #[test]

@@ -6,13 +6,16 @@ pub mod hooks;
 
 use std::{
     fmt::Debug,
-    mem::take,
+    mem::{forget, take},
     ops::{Deref, DerefMut},
     panic::{self, AssertUnwindSafe},
     sync::Arc,
 };
 
-use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{
+    Condvar, MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard,
+    RwLockWriteGuard,
+};
 
 /// An [`RwLock`] wrapper that fires registered callbacks when a write guard is released.
 ///
@@ -264,6 +267,136 @@ impl<T> RwLockNotify<T> {
     }
 }
 
+pub struct MappedRwLockNotifyWriteGuard<'a, T> {
+    guard: Option<MappedRwLockWriteGuard<'a, T>>,
+    state: Arc<LockState>,
+}
+
+impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
+    pub fn map<U, F>(mut self, f: F) -> MappedRwLockNotifyWriteGuard<'a, U>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state.clone();
+        forget(self);
+        let map_guard = RwLockWriteGuard::map(guard, f);
+        MappedRwLockNotifyWriteGuard {
+            guard: Some(map_guard),
+            state,
+        }
+    }
+
+    pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockNotifyWriteGuard<'a, U>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state.clone();
+        forget(self);
+        match RwLockWriteGuard::try_map(guard, f) {
+            Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
+                guard: Some(map_guard),
+                state,
+            }),
+            Err(guard) => Err(Self {
+                guard: Some(guard),
+                state,
+            }),
+        }
+    }
+
+    pub fn try_map_err<U, F, E>(
+        mut self,
+        f: F,
+    ) -> Result<MappedRwLockNotifyWriteGuard<'a, U>, (Self, E)>
+    where
+        F: FnOnce(&mut T) -> Result<&mut U, E>,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state.clone();
+        forget(self);
+        match RwLockWriteGuard::try_map_or_err(guard, f) {
+            Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
+                guard: Some(map_guard),
+                state,
+            }),
+            Err((guard, err)) => Err((
+                Self {
+                    guard: Some(guard),
+                    state,
+                },
+                err,
+            )),
+        }
+    }
+}
+
+pub struct MappedRwLockNotifyReadGuard<'a, T> {
+    guard: Option<MappedRwLockReadGuard<'a, T>>,
+    state: Arc<LockState>,
+}
+
+impl<'a, T> RwLockNotifyReadGuard<'a, T> {
+    pub fn map<U, F>(mut self, f: F) -> MappedRwLockNotifyReadGuard<'a, U>
+    where
+        F: FnOnce(&T) -> &U,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state.clone();
+        forget(self);
+        let map_guard = RwLockReadGuard::map(guard, f);
+        MappedRwLockNotifyReadGuard {
+            guard: Some(map_guard),
+            state,
+        }
+    }
+
+    pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockNotifyReadGuard<'a, U>, Self>
+    where
+        F: FnOnce(&T) -> Option<&U>,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state.clone();
+        forget(self);
+        match RwLockReadGuard::try_map(guard, f) {
+            Ok(map_guard) => Ok(MappedRwLockNotifyReadGuard {
+                guard: Some(map_guard),
+                state,
+            }),
+            Err(guard) => Err(Self {
+                guard: Some(guard),
+                state,
+            }),
+        }
+    }
+
+    pub fn try_map_or_err<U, F, E>(
+        mut self,
+        f: F,
+    ) -> Result<MappedRwLockNotifyReadGuard<'a, U>, (Self, E)>
+    where
+        F: FnOnce(&T) -> Result<&U, E>,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state.clone();
+        forget(self);
+        match RwLockReadGuard::try_map_or_err(guard, f) {
+            Ok(map_guard) => Ok(MappedRwLockNotifyReadGuard {
+                guard: Some(map_guard),
+                state,
+            }),
+            Err((guard, err)) => Err((
+                Self {
+                    guard: Some(guard),
+                    state,
+                },
+                err,
+            )),
+        }
+    }
+}
+
 /// Drops `write_guard` (releasing the exclusive lock), resets `dropping` to `false`,
 /// notifies waiters, then runs all collected callbacks, re-raising the first panic.
 ///
@@ -298,63 +431,83 @@ fn drain_and_run(state: &Arc<LockState>, callbacks: Vec<Box<dyn FnOnce() + Send>
 
 impl<'a, T> Drop for RwLockNotifyReadGuard<'a, T> {
     fn drop(&mut self) {
-        drop(self.guard.take());
+        drop_read_guard(&mut self.guard, &self.state)
+    }
+}
+
+impl<'a, T> Drop for MappedRwLockNotifyReadGuard<'a, T> {
+    fn drop(&mut self) {
+        drop_read_guard(&mut self.guard, &self.state)
+    }
+}
+
+fn drop_read_guard<G>(guard: &mut Option<G>, state: &Arc<LockState>) {
+    drop(guard.take());
+
+    #[cfg(feature = "test-hooks")]
+    hooks::run(hooks::HookPoint::ReadGuardAfterRelease);
+
+    let callbacks = {
+        let mut inner = state.inner.lock();
+        inner.readers -= 1;
+        // Only the last reader drains; also skip if a concurrent drain is
+        // already running (`dropping = true`) — it would create a deadlock
+        // because both sides would sleep on `locking_zero` but
+        // `notify_one` only wakes a single waiter.
+        if inner.readers > 0 || inner.callbacks.is_empty() || inner.dropping {
+            return;
+        }
+        inner.dropping = true;
 
         #[cfg(feature = "test-hooks")]
-        hooks::run(hooks::HookPoint::ReadGuardAfterRelease);
+        hooks::run(hooks::HookPoint::ReadGuardAfterSettingDropping);
 
-        let callbacks = {
-            let mut inner = self.state.inner.lock();
-            inner.readers -= 1;
-            // Only the last reader drains; also skip if a concurrent drain is
-            // already running (`dropping = true`) — it would create a deadlock
-            // because both sides would sleep on `locking_zero` but
-            // `notify_one` only wakes a single waiter.
-            if inner.readers > 0 || inner.callbacks.is_empty() || inner.dropping {
-                return;
-            }
-            inner.dropping = true;
+        while inner.locking != 0 {
+            state.locking_zero.wait(&mut inner);
+        }
+        take(&mut inner.callbacks)
+    };
 
-            #[cfg(feature = "test-hooks")]
-            hooks::run(hooks::HookPoint::ReadGuardAfterSettingDropping);
-
-            while inner.locking != 0 {
-                self.state.locking_zero.wait(&mut inner);
-            }
-            take(&mut inner.callbacks)
-        };
-
-        // The read lock is already released; pass `()` so drain_and_run has
-        // nothing to drop before resetting `dropping` and running callbacks.
-        drain_and_run(&self.state, callbacks);
-    }
+    // The read lock is already released; pass `()` so drain_and_run has
+    // nothing to drop before resetting `dropping` and running callbacks.
+    drain_and_run(state, callbacks);
 }
 
 impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
     fn drop(&mut self) {
-        #[cfg(feature = "test-hooks")]
-        hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
-
-        let callbacks = {
-            let mut inner = self.state.inner.lock();
-            inner.dropping = true;
-
-            #[cfg(feature = "test-hooks")]
-            hooks::run(hooks::HookPoint::WriteGuardAfterSettingDropping);
-
-            // Sleep until all in-flight try_write_or calls have either
-            // registered their callback or obtained the lock.
-            while inner.locking != 0 {
-                self.state.locking_zero.wait(&mut inner);
-            }
-            take(&mut inner.callbacks)
-            // Mutex released here — callbacks execute without holding any lock.
-        };
-
-        drop(self.guard.take().unwrap());
-
-        drain_and_run(&self.state, callbacks);
+        drop_write_guard(&mut self.guard, &self.state)
     }
+}
+
+impl<'a, T> Drop for MappedRwLockNotifyWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        drop_write_guard(&mut self.guard, &self.state)
+    }
+}
+
+fn drop_write_guard<G>(guard: &mut Option<G>, state: &Arc<LockState>) {
+    #[cfg(feature = "test-hooks")]
+    hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
+
+    let callbacks = {
+        let mut inner = state.inner.lock();
+        inner.dropping = true;
+
+        #[cfg(feature = "test-hooks")]
+        hooks::run(hooks::HookPoint::WriteGuardAfterSettingDropping);
+
+        // Sleep until all in-flight try_write_or calls have either
+        // registered their callback or obtained the lock.
+        while inner.locking != 0 {
+            state.locking_zero.wait(&mut inner);
+        }
+        take(&mut inner.callbacks)
+        // Mutex released here — callbacks execute without holding any lock.
+    };
+
+    drop(guard.take().unwrap());
+
+    drain_and_run(state, callbacks);
 }
 
 impl<T> From<T> for RwLockNotify<T> {

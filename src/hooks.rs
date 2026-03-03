@@ -1,0 +1,245 @@
+//! Test-hook infrastructure for deterministic race-condition testing.
+//!
+//! Only compiled when the `test-hooks` Cargo feature is enabled.
+//!
+//! # Quick start
+//!
+//! ```ignore
+//! use lock_notify::hooks::{self, Gate, HookPoint, TestGuard};
+//!
+//! #[test]
+//! fn my_race_test() {
+//!     let _g = TestGuard::acquire(); // serialise hook tests, auto-clears on drop
+//!
+//!     let gate = Gate::new();
+//!     let g2   = gate.clone();
+//!     hooks::set(HookPoint::TryWriteOrBeforeAcquire, move || g2.wait());
+//!
+//!     let t = thread::spawn(|| lock.try_write_or(|| {}));
+//!     gate.wait_for_arrival(); // thread is now paused
+//!     // … do concurrent work …
+//!     gate.open();             // release the thread
+//!     t.join().unwrap();
+//! }
+//! ```
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Condvar, Mutex, OnceLock},
+};
+
+// ─── HookPoint ───────────────────────────────────────────────────────────────
+
+/// A point in the library code where a hook can be inserted.
+///
+/// Every variant is reached with **no library locks held**, so hook functions
+/// (including [`Gate::wait`]) may safely call back into [`RwLockNotify`][crate::RwLockNotify].
+///
+/// **Exception:** avoid calling `try_write_or` from a hook placed at
+/// [`DrainAfterWriteLockRelease`][HookPoint::DrainAfterWriteLockRelease],
+/// because `dropping` is still `true` at that point and the call will block
+/// until the drain finishes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum HookPoint {
+    /// [`try_write_or`][crate::RwLockNotify::try_write_or]: the `locking`
+    /// counter has been incremented and the state mutex released, but
+    /// `try_write` has not yet been called.
+    TryWriteOrBeforeAcquire,
+
+    /// `Drop for RwLockNotifyWriteGuard`: called before acquiring the state
+    /// mutex to begin the drain sequence.
+    WriteGuardBeforeDrop,
+
+    /// `Drop for RwLockNotifyReadGuard`: the underlying read lock has been
+    /// released, but the state mutex has not yet been acquired to decrement
+    /// the `readers` counter.
+    ReadGuardAfterRelease,
+
+    /// `drain_and_run`: the write lock has been dropped, but `dropping` has
+    /// not yet been reset to `false`.
+    DrainAfterWriteLockRelease,
+
+    /// `drain_and_run`: `dropping` has been reset to `false` and
+    /// `not_dropping` has been notified, but callbacks have not yet started.
+    DrainBeforeCallbacks,
+
+    /// `Drop for RwLockNotifyWriteGuard`: `dropping` has just been set to
+    /// `true`; the `locking_zero` wait has not yet started.
+    ///
+    /// **⚠ Called while holding the library's internal state mutex.**
+    /// The hook function **must not** block, call any [`RwLockNotify`][crate::RwLockNotify]
+    /// method, or acquire any mutex that could form a cycle with the state
+    /// mutex.  Safe operations: [`Gate::signal`], atomic stores, non-blocking
+    /// channel sends.
+    WriteGuardAfterSettingDropping,
+
+    /// `Drop for RwLockNotifyReadGuard`: `dropping` has just been set to
+    /// `true` (only fires when this guard triggers the drain, i.e. when it is
+    /// the last reader with pending callbacks); the `locking_zero` wait has
+    /// not yet started.
+    ///
+    /// Same constraints as [`WriteGuardAfterSettingDropping`].
+    ReadGuardAfterSettingDropping,
+
+    /// `try_write_or_else`: the `while inner.dropping` loop body has been
+    /// entered (i.e. `dropping` is `true`), just before `not_dropping.wait()`.
+    ///
+    /// **⚠ Called while holding the library's internal state mutex.**
+    /// Same constraints as [`WriteGuardAfterSettingDropping`].
+    TryWriteOrWhileDropping,
+}
+
+// ─── Registry ────────────────────────────────────────────────────────────────
+
+type HookFn = Arc<dyn Fn() + Send + Sync + 'static>;
+
+fn registry() -> &'static Mutex<HashMap<HookPoint, HookFn>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<HookPoint, HookFn>>> = OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+
+/// Runs the hook registered for `point`, if any.
+///
+/// The registry lock is released **before** calling the hook function, so
+/// hooks may freely call [`set`], [`clear`], or re-enter [`run`] without
+/// deadlocking.
+pub(crate) fn run(point: HookPoint) {
+    let f = registry().lock().unwrap().get(&point).cloned();
+    if let Some(f) = f {
+        f();
+    }
+}
+
+/// Registers `f` as the hook for `point`, replacing any existing hook.
+pub fn set(point: HookPoint, f: impl Fn() + Send + Sync + 'static) {
+    registry().lock().unwrap().insert(point, Arc::new(f));
+}
+
+/// Removes the hook for `point`.
+pub fn clear(point: HookPoint) {
+    registry().lock().unwrap().remove(&point);
+}
+
+/// Removes all registered hooks.
+pub fn clear_all() {
+    registry().lock().unwrap().clear();
+}
+
+// ─── TestGuard ───────────────────────────────────────────────────────────────
+
+/// Ensures hook-based tests run serially and auto-clears all hooks on drop.
+///
+/// Acquire one at the start of every test that registers hooks:
+///
+/// ```ignore
+/// let _g = TestGuard::acquire();
+/// ```
+pub struct TestGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl TestGuard {
+    /// Acquires the global test serialisation lock and clears any leftover hooks.
+    pub fn acquire() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        Self(guard)
+    }
+}
+
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        clear_all();
+    }
+}
+
+// ─── Gate ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum GateState {
+    #[default]
+    Idle,
+    Arrived,
+    Open,
+}
+
+/// Blocks a thread at a hook point until the test releases it.
+///
+/// Typical pattern:
+///
+/// ```ignore
+/// let gate = Gate::new();
+/// let g2   = gate.clone();
+///
+/// hooks::set(HookPoint::TryWriteOrBeforeAcquire, move || g2.wait());
+///
+/// let t = thread::spawn(|| lock.try_write_or(|| {}));
+/// gate.wait_for_arrival(); // test blocks here until thread reaches the hook
+/// // … perform concurrent work while the thread is paused …
+/// gate.open();             // unblock the thread
+/// t.join().unwrap();
+/// ```
+///
+/// A `Gate` is single-use by default; call [`reset`][Gate::reset] to reuse it.
+#[derive(Debug)]
+pub struct Gate {
+    state: Mutex<GateState>,
+    cv: Condvar,
+}
+
+impl Gate {
+    /// Creates a new gate wrapped in an [`Arc`] for easy cloning.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(GateState::Idle),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Blocks the calling thread until [`open`][Self::open] is called.
+    ///
+    /// Signals arrival before blocking so the test thread can detect it via
+    /// [`wait_for_arrival`][Self::wait_for_arrival].
+    pub fn wait(&self) {
+        let mut s = self.state.lock().unwrap();
+        *s = GateState::Arrived;
+        self.cv.notify_all();
+        while *s == GateState::Arrived {
+            s = self.cv.wait(s).unwrap();
+        }
+    }
+
+    /// Blocks until the thread calls [`wait`][Self::wait] (i.e., arrives at
+    /// the hook point).
+    pub fn wait_for_arrival(&self) {
+        let mut s = self.state.lock().unwrap();
+        while *s != GateState::Arrived {
+            s = self.cv.wait(s).unwrap();
+        }
+    }
+
+    /// Unblocks the thread waiting in [`wait`][Self::wait].
+    pub fn open(&self) {
+        let mut s = self.state.lock().unwrap();
+        *s = GateState::Open;
+        self.cv.notify_all();
+    }
+
+    /// Signals arrival non-blockingly, without waiting for [`open`][Self::open].
+    ///
+    /// Safe to call while holding the library's internal state mutex because it
+    /// does not block.  Use this from hook points that are called under the
+    /// mutex (e.g. [`HookPoint::WriteGuardAfterSettingDropping`]).
+    pub fn signal(&self) {
+        let mut s = self.state.lock().unwrap();
+        *s = GateState::Arrived;
+        self.cv.notify_all();
+    }
+
+    /// Resets the gate to its initial state so it can be used again.
+    pub fn reset(&self) {
+        *self.state.lock().unwrap() = GateState::Idle;
+    }
+}

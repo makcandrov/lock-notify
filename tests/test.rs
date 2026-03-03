@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 #[test]
 fn test_callback() {
     let lock = RwLock::new(12u64);
-    let lock_callback = Arc::new(RwLockNotify::from_inner(lock));
+    let lock_callback = Arc::new(RwLockNotify::from_lock(lock));
 
     let step = Arc::new(AtomicU64::new(0));
     let callback_allowed = Arc::new(AtomicBool::new(false));
@@ -123,7 +123,7 @@ fn test_callback_panic_does_not_skip_subsequent() {
     let called = Arc::new(AtomicBool::new(false));
     let called2 = called.clone();
 
-    let guard = lock.write();
+    let guard = lock.try_write().unwrap();
     let _ = lock.try_write_or(|| panic!("intentional panic in callback"));
     let _ = lock.try_write_or(move || called2.store(true, Relaxed));
 
@@ -470,6 +470,7 @@ fn test_stress_many_writers_one_reader() {
     let callback_count = Arc::new(AtomicU64::new(0));
 
     let r = lock.read();
+    assert_eq!(*r, 0);
 
     thread::scope(|s| {
         for _ in 0..WRITERS {
@@ -477,9 +478,12 @@ fn test_stress_many_writers_one_reader() {
             let sc = success_count.clone();
             let cc = callback_count.clone();
             s.spawn(move || {
-                if lock2.try_write_or(move || {
-                    cc.fetch_add(1, Relaxed);
-                }).is_some() {
+                if lock2
+                    .try_write_or(move || {
+                        cc.fetch_add(1, Relaxed);
+                    })
+                    .is_some()
+                {
                     sc.fetch_add(1, Relaxed);
                 }
             });
@@ -511,6 +515,7 @@ fn test_write_guard_drop_then_read_guard_drop_sequence() {
     // Phase 1: write guard registers and fires first callback.
     {
         let w = lock.write();
+        assert_eq!(*w, 0);
         assert!(
             lock.try_write_or(move || first2.store(true, Relaxed))
                 .is_none()
@@ -521,6 +526,8 @@ fn test_write_guard_drop_then_read_guard_drop_sequence() {
 
     // Phase 2: read guard is live when a new callback is registered.
     let r = lock.read();
+    assert_eq!(*r, 0);
+
     assert!(
         lock.try_write_or(move || second2.store(true, Relaxed))
             .is_none()

@@ -1,6 +1,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![doc = include_str!("../README.md")]
 
+#[cfg(feature = "test-hooks")]
+pub mod hooks;
+
 use std::{
     fmt::Debug,
     mem::take,
@@ -74,15 +77,21 @@ struct LockState {
     not_dropping: Condvar,
 }
 
+impl Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("dropping", &self.dropping)
+            .field("locking", &self.locking)
+            .field("readers", &self.readers)
+            .field("callbacks", &"{callbacks}")
+            .finish()
+    }
+}
+
 impl Debug for LockState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.inner.try_lock() {
-            Some(inner) => f
-                .debug_struct("LockState")
-                .field("dropping", &inner.dropping)
-                .field("locking", &inner.locking)
-                .field("callbacks", &"{callbacks}")
-                .finish(),
+            Some(inner) => Debug::fmt(&inner, f),
             None => f
                 .debug_struct("LockState")
                 .field("inner", &"<locked>")
@@ -93,12 +102,16 @@ impl Debug for LockState {
 
 impl<T> RwLockNotify<T> {
     /// Creates a new `RwLockNotify` wrapping `value`.
+    #[inline]
+    #[must_use]
     pub fn new(value: T) -> Self {
-        Self::from_inner(RwLock::new(value))
+        Self::from_lock(RwLock::new(value))
     }
 
     /// Creates a new `RwLockNotify` from an existing [`RwLock`].
-    pub fn from_inner(lock: RwLock<T>) -> Self {
+    #[inline]
+    #[must_use]
+    pub fn from_lock(lock: RwLock<T>) -> Self {
         Self {
             lock,
             state: Arc::new(LockState::default()),
@@ -108,6 +121,7 @@ impl<T> RwLockNotify<T> {
     /// Consumes the lock and returns the inner value.
     ///
     /// Any callbacks pending in the queue are dropped without being called.
+    #[inline]
     #[must_use]
     pub fn into_inner(self) -> T {
         self.lock.into_inner()
@@ -119,6 +133,7 @@ impl<T> RwLockNotify<T> {
     /// [`try_write_or`] are flushed if this was the last reader holding the lock.
     ///
     /// [`try_write_or`]: RwLockNotify::try_write_or
+    #[must_use]
     pub fn read(&self) -> RwLockNotifyReadGuard<'_, T> {
         let guard = self.lock.read();
         self.state.inner.lock().readers += 1;
@@ -176,20 +191,56 @@ impl<T> RwLockNotify<T> {
     ///   called, without holding any lock, after the next write guard is dropped.
     ///
     /// Callbacks are called in FIFO registration order.
+    #[inline]
     #[must_use]
-    pub fn try_write_or<'a>(
+    pub fn try_write_or<'a, Callback>(
         &'a self,
-        callback: impl FnOnce() + Send + 'static,
-    ) -> Option<RwLockNotifyWriteGuard<'a, T>> {
+        callback: Callback,
+    ) -> Option<RwLockNotifyWriteGuard<'a, T>>
+    where
+        Callback: FnOnce() + Send + 'static,
+    {
+        self.try_write_or_else(|| callback)
+    }
+
+    /// Attempts to acquire exclusive write access without blocking, lazily constructing
+    /// the callback only if the lock is unavailable.
+    ///
+    /// - **Success** — returns `Some(guard)` and never calls `callback`.
+    /// - **Failure** — calls `callback()` to produce the callback, queues it, and returns
+    ///   `None`. The callback will be called, without holding any lock, after the next
+    ///   write guard is dropped.
+    ///
+    /// Prefer this over [`try_write_or`] when constructing the callback is expensive
+    /// or has side effects that should only occur on failure.
+    ///
+    /// Callbacks are called in FIFO registration order.
+    ///
+    /// [`try_write_or`]: Self::try_write_or
+    #[must_use]
+    pub fn try_write_or_else<'a, Callback>(
+        &'a self,
+        callback: impl FnOnce() -> Callback,
+    ) -> Option<RwLockNotifyWriteGuard<'a, T>>
+    where
+        Callback: FnOnce() + Send + 'static,
+    {
         // Atomically wait until not dropping, then increment locking.
         // Both steps happen under the same mutex, which eliminates the TOCTOU
         // that required SeqCst atomic ordering in the spin-based version.
         let mut inner = self.state.inner.lock();
+
         while inner.dropping {
+            #[cfg(feature = "test-hooks")]
+            hooks::run(hooks::HookPoint::TryWriteOrWhileDropping);
+
             self.state.not_dropping.wait(&mut inner);
         }
         inner.locking += 1;
         drop(inner);
+
+        #[cfg(feature = "test-hooks")]
+        hooks::run(hooks::HookPoint::TryWriteOrBeforeAcquire);
 
         if let Some(guard) = self.lock.try_write() {
             let mut inner = self.state.inner.lock();
@@ -203,7 +254,7 @@ impl<T> RwLockNotify<T> {
             })
         } else {
             let mut inner = self.state.inner.lock();
-            inner.callbacks.push(Box::new(callback));
+            inner.callbacks.push(Box::new(callback()));
             inner.locking -= 1;
             if inner.locking == 0 {
                 self.state.locking_zero.notify_one();
@@ -213,34 +264,22 @@ impl<T> RwLockNotify<T> {
     }
 }
 
-impl<T> From<T> for RwLockNotify<T> {
-    fn from(value: T) -> Self {
-        Self::new(value)
-    }
-}
-
-impl<T> From<RwLock<T>> for RwLockNotify<T> {
-    fn from(lock: RwLock<T>) -> Self {
-        Self::from_inner(lock)
-    }
-}
-
 /// Drops `write_guard` (releasing the exclusive lock), resets `dropping` to `false`,
 /// notifies waiters, then runs all collected callbacks, re-raising the first panic.
 ///
 /// Callers must have already set `dropping = true` and drained the callback queue.
-fn drain_and_run<W>(
-    write_guard: W,
-    state: &Arc<LockState>,
-    callbacks: Vec<Box<dyn FnOnce() + Send>>,
-) {
-    drop(write_guard);
+fn drain_and_run(state: &Arc<LockState>, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
+    #[cfg(feature = "test-hooks")]
+    hooks::run(hooks::HookPoint::DrainAfterWriteLockRelease);
 
     {
         let mut inner = state.inner.lock();
         inner.dropping = false;
         state.not_dropping.notify_all();
     }
+
+    #[cfg(feature = "test-hooks")]
+    hooks::run(hooks::HookPoint::DrainBeforeCallbacks);
 
     // Run every callback regardless of panics, then re-raise the first
     // panic (if any) after all callbacks have had a chance to execute.
@@ -261,6 +300,9 @@ impl<'a, T> Drop for RwLockNotifyReadGuard<'a, T> {
     fn drop(&mut self) {
         drop(self.guard.take());
 
+        #[cfg(feature = "test-hooks")]
+        hooks::run(hooks::HookPoint::ReadGuardAfterRelease);
+
         let callbacks = {
             let mut inner = self.state.inner.lock();
             inner.readers -= 1;
@@ -272,6 +314,10 @@ impl<'a, T> Drop for RwLockNotifyReadGuard<'a, T> {
                 return;
             }
             inner.dropping = true;
+
+            #[cfg(feature = "test-hooks")]
+            hooks::run(hooks::HookPoint::ReadGuardAfterSettingDropping);
+
             while inner.locking != 0 {
                 self.state.locking_zero.wait(&mut inner);
             }
@@ -280,15 +326,22 @@ impl<'a, T> Drop for RwLockNotifyReadGuard<'a, T> {
 
         // The read lock is already released; pass `()` so drain_and_run has
         // nothing to drop before resetting `dropping` and running callbacks.
-        drain_and_run((), &self.state, callbacks);
+        drain_and_run(&self.state, callbacks);
     }
 }
 
 impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
     fn drop(&mut self) {
+        #[cfg(feature = "test-hooks")]
+        hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
+
         let callbacks = {
             let mut inner = self.state.inner.lock();
             inner.dropping = true;
+
+            #[cfg(feature = "test-hooks")]
+            hooks::run(hooks::HookPoint::WriteGuardAfterSettingDropping);
+
             // Sleep until all in-flight try_write_or calls have either
             // registered their callback or obtained the lock.
             while inner.locking != 0 {
@@ -298,7 +351,30 @@ impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
             // Mutex released here — callbacks execute without holding any lock.
         };
 
-        drain_and_run(self.guard.take().unwrap(), &self.state, callbacks);
+        drop(self.guard.take().unwrap());
+
+        drain_and_run(&self.state, callbacks);
+    }
+}
+
+impl<T> From<T> for RwLockNotify<T> {
+    #[inline]
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl<T> From<RwLock<T>> for RwLockNotify<T> {
+    #[inline]
+    fn from(lock: RwLock<T>) -> Self {
+        Self::from_lock(lock)
+    }
+}
+
+impl<T> From<RwLockNotify<T>> for RwLock<T> {
+    #[inline]
+    fn from(lock: RwLockNotify<T>) -> Self {
+        lock.lock
     }
 }
 

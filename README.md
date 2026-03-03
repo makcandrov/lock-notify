@@ -2,6 +2,8 @@
 
 An [`RwLock`] wrapper that fires callbacks when a write guard is released.
 
+[`RwLock`]: https://docs.rs/parking_lot/latest/parking_lot/type.RwLock.html
+
 ## The problem
 
 `RwLock::try_write` returns `None` when the lock is contended — and gives you no way to know when it becomes free. You're left choosing between spinning, blocking, or silently dropping work.

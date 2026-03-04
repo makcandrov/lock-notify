@@ -540,7 +540,7 @@ impl<'a, T> Deref for RwLockNotifyReadGuard<'a, T> {
 }
 
 impl<'a, T> Deref for RwLockNotifyWriteGuard<'a, T> {
-    type Target = <RwLockWriteGuard<'a, T> as Deref>::Target;
+    type Target = T;
 
     fn deref(&self) -> &Self::Target {
         Deref::deref(self.guard.as_ref().unwrap())
@@ -548,6 +548,28 @@ impl<'a, T> Deref for RwLockNotifyWriteGuard<'a, T> {
 }
 
 impl<'a, T> DerefMut for RwLockNotifyWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        DerefMut::deref_mut(self.guard.as_mut().unwrap())
+    }
+}
+
+impl<'a, T> Deref for MappedRwLockNotifyReadGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
+    }
+}
+
+impl<'a, T> Deref for MappedRwLockNotifyWriteGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
+    }
+}
+
+impl<'a, T> DerefMut for MappedRwLockNotifyWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         DerefMut::deref_mut(self.guard.as_mut().unwrap())
     }

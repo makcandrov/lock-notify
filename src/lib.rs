@@ -267,6 +267,7 @@ impl<T> RwLockNotify<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct MappedRwLockNotifyWriteGuard<'a, T> {
     guard: Option<MappedRwLockWriteGuard<'a, T>>,
     state: Arc<LockState>,
@@ -332,6 +333,7 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
     }
 }
 
+#[derive(Debug)]
 pub struct MappedRwLockNotifyReadGuard<'a, T> {
     guard: Option<MappedRwLockReadGuard<'a, T>>,
     state: Arc<LockState>,

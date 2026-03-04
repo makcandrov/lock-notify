@@ -1,6 +1,6 @@
 # lock-notify
 
-An [`RwLock`] wrapper that fires callbacks when a write guard is released.
+An [`RwLock`] wrapper that fires callbacks when write access becomes available.
 
 [`RwLock`]: https://docs.rs/parking_lot/latest/parking_lot/type.RwLock.html
 
@@ -25,11 +25,14 @@ lock.try_write_or(|| println!("lock is free now"));
 drop(guard);
 ```
 
-When `try_write_or` fails, the callback is queued. When the write guard is dropped, every queued callback is called in FIFO order — without holding any lock.
+When `try_write_or` fails, the callback is queued. Queued callbacks are flushed in FIFO order — without holding any lock — when either:
+
+- a write guard is dropped, or
+- the last active read guard is dropped (if callbacks were queued while readers held the lock).
 
 ## Callback semantics
 
-- Callbacks are called **after** the write lock is released, in registration order.
+- Callbacks are called **after** the lock is released, in registration order.
 - A callback is a notification, not a lock acquisition — the lock may already be held again by the time it fires.
 - Callbacks must be `FnOnce + Send + 'static`.
 - A panic in a callback does not affect subsequent callbacks.

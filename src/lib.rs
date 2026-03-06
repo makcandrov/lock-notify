@@ -267,6 +267,11 @@ impl<T> RwLockNotify<T> {
     }
 }
 
+/// RAII write guard produced by [`RwLockNotifyWriteGuard::map`] and related methods.
+///
+/// Provides exclusive write access to a subfield of the protected value via [`Deref`]
+/// and [`DerefMut`]. When dropped, releases the lock and flushes pending callbacks
+/// just like [`RwLockNotifyWriteGuard`].
 #[derive(Debug)]
 pub struct MappedRwLockNotifyWriteGuard<'a, T> {
     guard: Option<MappedRwLockWriteGuard<'a, T>>,
@@ -274,6 +279,8 @@ pub struct MappedRwLockNotifyWriteGuard<'a, T> {
 }
 
 impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
+    /// Transforms this guard into a [`MappedRwLockNotifyWriteGuard`] that dereferences
+    /// to a subfield of the protected value.
     pub fn map<U, F>(mut self, f: F) -> MappedRwLockNotifyWriteGuard<'a, U>
     where
         F: FnOnce(&mut T) -> &mut U,
@@ -288,6 +295,9 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
         }
     }
 
+    /// Attempts to transform this guard into a [`MappedRwLockNotifyWriteGuard`].
+    ///
+    /// Returns `Err(self)` if `f` returns `None`, giving the original guard back.
     pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockNotifyWriteGuard<'a, U>, Self>
     where
         F: FnOnce(&mut T) -> Option<&mut U>,
@@ -307,6 +317,10 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
         }
     }
 
+    /// Attempts to transform this guard into a [`MappedRwLockNotifyWriteGuard`].
+    ///
+    /// Returns `Err((self, error))` if `f` returns `Err`, giving the original guard
+    /// and the error back.
     pub fn try_map_err<U, F, E>(
         mut self,
         f: F,
@@ -333,6 +347,11 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
     }
 }
 
+/// RAII read guard produced by [`RwLockNotifyReadGuard::map`] and related methods.
+///
+/// Provides shared read access to a subfield of the protected value via [`Deref`].
+/// When dropped, releases the read lock and flushes pending callbacks just like
+/// [`RwLockNotifyReadGuard`].
 #[derive(Debug)]
 pub struct MappedRwLockNotifyReadGuard<'a, T> {
     guard: Option<MappedRwLockReadGuard<'a, T>>,
@@ -340,6 +359,8 @@ pub struct MappedRwLockNotifyReadGuard<'a, T> {
 }
 
 impl<'a, T> RwLockNotifyReadGuard<'a, T> {
+    /// Transforms this guard into a [`MappedRwLockNotifyReadGuard`] that dereferences
+    /// to a subfield of the protected value.
     pub fn map<U, F>(mut self, f: F) -> MappedRwLockNotifyReadGuard<'a, U>
     where
         F: FnOnce(&T) -> &U,
@@ -354,6 +375,9 @@ impl<'a, T> RwLockNotifyReadGuard<'a, T> {
         }
     }
 
+    /// Attempts to transform this guard into a [`MappedRwLockNotifyReadGuard`].
+    ///
+    /// Returns `Err(self)` if `f` returns `None`, giving the original guard back.
     pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockNotifyReadGuard<'a, U>, Self>
     where
         F: FnOnce(&T) -> Option<&U>,
@@ -373,6 +397,10 @@ impl<'a, T> RwLockNotifyReadGuard<'a, T> {
         }
     }
 
+    /// Attempts to transform this guard into a [`MappedRwLockNotifyReadGuard`].
+    ///
+    /// Returns `Err((self, error))` if `f` returns `Err`, giving the original guard
+    /// and the error back.
     pub fn try_map_or_err<U, F, E>(
         mut self,
         f: F,

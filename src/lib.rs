@@ -16,51 +16,6 @@ use parking_lot::{
     RwLockWriteGuard,
 };
 
-/// An [`RwLock`] wrapper that fires registered callbacks when a write guard is released.
-///
-/// When [`try_write_or`] cannot acquire the lock, the provided callback is queued.
-/// All queued callbacks are called in FIFO order, without holding any lock, when the
-/// next write guard is dropped.
-///
-/// [`try_write_or`]: RwLockNotify::try_write_or
-#[derive(Debug)]
-pub struct RwLockNotify<T> {
-    lock: RwLock<T>,
-    state: LockState,
-}
-
-/// RAII read guard for [`RwLockNotify`].
-///
-/// Provides shared read access to the protected value via [`Deref`].
-/// When dropped, releases the read lock and, if this was the last active
-/// read guard, immediately flushes any pending callbacks that were registered
-/// via [`try_write_or`].
-///
-/// Obtained via [`RwLockNotify::read`] or [`RwLockNotify::try_read`].
-///
-/// [`try_write_or`]: RwLockNotify::try_write_or
-#[derive(Debug)]
-pub struct RwLockNotifyReadGuard<'a, T> {
-    guard: Option<RwLockReadGuard<'a, T>>,
-    state: &'a LockState,
-}
-
-/// RAII write guard for [`RwLockNotify`].
-///
-/// Provides exclusive write access to the protected value via [`Deref`] and [`DerefMut`].
-/// When dropped, releases the lock and calls all callbacks that were registered via
-/// [`try_write_or`] while this guard was held.
-///
-/// Obtained via [`RwLockNotify::write`], [`RwLockNotify::try_write`], or
-/// [`RwLockNotify::try_write_or`].
-///
-/// [`try_write_or`]: RwLockNotify::try_write_or
-#[derive(Debug)]
-pub struct RwLockNotifyWriteGuard<'a, T> {
-    guard: Option<RwLockWriteGuard<'a, T>>,
-    state: &'a LockState,
-}
-
 #[derive(Default)]
 struct Inner {
     dropping: bool,
@@ -68,15 +23,6 @@ struct Inner {
     /// Number of live [`RwLockNotifyReadGuard`] instances.
     readers: u64,
     callbacks: Vec<Box<dyn FnOnce() + Send>>,
-}
-
-#[derive(Default)]
-struct LockState {
-    inner: Mutex<Inner>,
-    /// Notified when `locking` reaches zero (dropper is waiting on this).
-    locking_zero: Condvar,
-    /// Notified when `dropping` becomes false (try_write callers wait on this).
-    not_dropping: Condvar,
 }
 
 impl Debug for Inner {
@@ -90,6 +36,15 @@ impl Debug for Inner {
     }
 }
 
+#[derive(Default)]
+struct LockState {
+    inner: Mutex<Inner>,
+    /// Notified when `locking` reaches zero (dropper is waiting on this).
+    locking_zero: Condvar,
+    /// Notified when `dropping` becomes false (try_write callers wait on this).
+    not_dropping: Condvar,
+}
+
 impl Debug for LockState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.inner.try_lock() {
@@ -100,6 +55,19 @@ impl Debug for LockState {
                 .finish(),
         }
     }
+}
+
+/// An [`RwLock`] wrapper that fires registered callbacks when a write guard is released.
+///
+/// When [`try_write_or`] cannot acquire the lock, the provided callback is queued.
+/// All queued callbacks are called in FIFO order, without holding any lock, when the
+/// next write guard is dropped.
+///
+/// [`try_write_or`]: RwLockNotify::try_write_or
+#[derive(Debug)]
+pub struct RwLockNotify<T> {
+    lock: RwLock<T>,
+    state: LockState,
 }
 
 impl<T> RwLockNotify<T> {
@@ -266,94 +234,40 @@ impl<T> RwLockNotify<T> {
     }
 }
 
-/// RAII write guard produced by [`RwLockNotifyWriteGuard::map`] and related methods.
-///
-/// Provides exclusive write access to a subfield of the protected value via [`Deref`]
-/// and [`DerefMut`]. When dropped, releases the lock and flushes pending callbacks
-/// just like [`RwLockNotifyWriteGuard`].
-#[derive(Debug)]
-pub struct MappedRwLockNotifyWriteGuard<'a, T> {
-    guard: Option<MappedRwLockWriteGuard<'a, T>>,
-    state: &'a LockState,
-}
-
-impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
-    /// Transforms this guard into a [`MappedRwLockNotifyWriteGuard`] that dereferences
-    /// to a subfield of the protected value.
-    pub fn map<U, F>(mut self, f: F) -> MappedRwLockNotifyWriteGuard<'a, U>
-    where
-        F: FnOnce(&mut T) -> &mut U,
-    {
-        let guard = self.guard.take().unwrap();
-        let state = self.state;
-        forget(self);
-        let map_guard = RwLockWriteGuard::map(guard, f);
-        MappedRwLockNotifyWriteGuard {
-            guard: Some(map_guard),
-            state,
-        }
-    }
-
-    /// Attempts to transform this guard into a [`MappedRwLockNotifyWriteGuard`].
-    ///
-    /// Returns `Err(self)` if `f` returns `None`, giving the original guard back.
-    pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockNotifyWriteGuard<'a, U>, Self>
-    where
-        F: FnOnce(&mut T) -> Option<&mut U>,
-    {
-        let guard = self.guard.take().unwrap();
-        let state = self.state;
-        forget(self);
-        match RwLockWriteGuard::try_map(guard, f) {
-            Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
-                guard: Some(map_guard),
-                state,
-            }),
-            Err(guard) => Err(Self {
-                guard: Some(guard),
-                state,
-            }),
-        }
-    }
-
-    /// Attempts to transform this guard into a [`MappedRwLockNotifyWriteGuard`].
-    ///
-    /// Returns `Err((self, error))` if `f` returns `Err`, giving the original guard
-    /// and the error back.
-    pub fn try_map_err<U, F, E>(
-        mut self,
-        f: F,
-    ) -> Result<MappedRwLockNotifyWriteGuard<'a, U>, (Self, E)>
-    where
-        F: FnOnce(&mut T) -> Result<&mut U, E>,
-    {
-        let guard = self.guard.take().unwrap();
-        let state = self.state;
-        forget(self);
-        match RwLockWriteGuard::try_map_or_err(guard, f) {
-            Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
-                guard: Some(map_guard),
-                state,
-            }),
-            Err((guard, err)) => Err((
-                Self {
-                    guard: Some(guard),
-                    state,
-                },
-                err,
-            )),
-        }
+impl<T> From<T> for RwLockNotify<T> {
+    #[inline]
+    fn from(value: T) -> Self {
+        Self::new(value)
     }
 }
 
-/// RAII read guard produced by [`RwLockNotifyReadGuard::map`] and related methods.
+impl<T> From<RwLock<T>> for RwLockNotify<T> {
+    #[inline]
+    fn from(lock: RwLock<T>) -> Self {
+        Self::from_lock(lock)
+    }
+}
+
+impl<T> From<RwLockNotify<T>> for RwLock<T> {
+    #[inline]
+    fn from(lock: RwLockNotify<T>) -> Self {
+        lock.lock
+    }
+}
+
+/// RAII read guard for [`RwLockNotify`].
 ///
-/// Provides shared read access to a subfield of the protected value via [`Deref`].
-/// When dropped, releases the read lock and flushes pending callbacks just like
-/// [`RwLockNotifyReadGuard`].
+/// Provides shared read access to the protected value via [`Deref`].
+/// When dropped, releases the read lock and, if this was the last active
+/// read guard, immediately flushes any pending callbacks that were registered
+/// via [`try_write_or`].
+///
+/// Obtained via [`RwLockNotify::read`] or [`RwLockNotify::try_read`].
+///
+/// [`try_write_or`]: RwLockNotify::try_write_or
 #[derive(Debug)]
-pub struct MappedRwLockNotifyReadGuard<'a, T> {
-    guard: Option<MappedRwLockReadGuard<'a, T>>,
+pub struct RwLockNotifyReadGuard<'a, T> {
+    guard: Option<RwLockReadGuard<'a, T>>,
     state: &'a LockState,
 }
 
@@ -426,35 +340,11 @@ impl<'a, T> RwLockNotifyReadGuard<'a, T> {
     }
 }
 
-/// Drops `write_guard` (releasing the exclusive lock), resets `dropping` to `false`,
-/// notifies waiters, then runs all collected callbacks, re-raising the first panic.
-///
-/// Callers must have already set `dropping = true` and drained the callback queue.
-fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
-    #[cfg(feature = "test-hooks")]
-    hooks::run(hooks::HookPoint::DrainAfterWriteLockRelease);
+impl<'a, T> Deref for RwLockNotifyReadGuard<'a, T> {
+    type Target = T;
 
-    {
-        let mut inner = state.inner.lock();
-        inner.dropping = false;
-        state.not_dropping.notify_all();
-    }
-
-    #[cfg(feature = "test-hooks")]
-    hooks::run(hooks::HookPoint::DrainBeforeCallbacks);
-
-    // Run every callback regardless of panics, then re-raise the first
-    // panic (if any) after all callbacks have had a chance to execute.
-    // `catch_unwind` is called unconditionally before `or` so that every
-    // callback runs even if an earlier one panicked (`or_else` would
-    // short-circuit and skip the remaining callbacks).
-    let first_panic = callbacks.into_iter().fold(None, |first, callback| {
-        let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
-        first.or(result)
-    });
-
-    if let Some(payload) = first_panic {
-        panic::resume_unwind(payload);
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
     }
 }
 
@@ -464,9 +354,164 @@ impl<'a, T> Drop for RwLockNotifyReadGuard<'a, T> {
     }
 }
 
+/// RAII read guard produced by [`RwLockNotifyReadGuard::map`] and related methods.
+///
+/// Provides shared read access to a subfield of the protected value via [`Deref`].
+/// When dropped, releases the read lock and flushes pending callbacks just like
+/// [`RwLockNotifyReadGuard`].
+#[derive(Debug)]
+pub struct MappedRwLockNotifyReadGuard<'a, T> {
+    guard: Option<MappedRwLockReadGuard<'a, T>>,
+    state: &'a LockState,
+}
+
+impl<'a, T> Deref for MappedRwLockNotifyReadGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
+    }
+}
+
 impl<'a, T> Drop for MappedRwLockNotifyReadGuard<'a, T> {
     fn drop(&mut self) {
         drop_read_guard(&mut self.guard, self.state)
+    }
+}
+
+/// RAII write guard for [`RwLockNotify`].
+///
+/// Provides exclusive write access to the protected value via [`Deref`] and [`DerefMut`].
+/// When dropped, releases the lock and calls all callbacks that were registered via
+/// [`try_write_or`] while this guard was held.
+///
+/// Obtained via [`RwLockNotify::write`], [`RwLockNotify::try_write`], or
+/// [`RwLockNotify::try_write_or`].
+///
+/// [`try_write_or`]: RwLockNotify::try_write_or
+#[derive(Debug)]
+pub struct RwLockNotifyWriteGuard<'a, T> {
+    guard: Option<RwLockWriteGuard<'a, T>>,
+    state: &'a LockState,
+}
+
+impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
+    /// Transforms this guard into a [`MappedRwLockNotifyWriteGuard`] that dereferences
+    /// to a subfield of the protected value.
+    pub fn map<U, F>(mut self, f: F) -> MappedRwLockNotifyWriteGuard<'a, U>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state;
+        forget(self);
+        let map_guard = RwLockWriteGuard::map(guard, f);
+        MappedRwLockNotifyWriteGuard {
+            guard: Some(map_guard),
+            state,
+        }
+    }
+
+    /// Attempts to transform this guard into a [`MappedRwLockNotifyWriteGuard`].
+    ///
+    /// Returns `Err(self)` if `f` returns `None`, giving the original guard back.
+    pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockNotifyWriteGuard<'a, U>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state;
+        forget(self);
+        match RwLockWriteGuard::try_map(guard, f) {
+            Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
+                guard: Some(map_guard),
+                state,
+            }),
+            Err(guard) => Err(Self {
+                guard: Some(guard),
+                state,
+            }),
+        }
+    }
+
+    /// Attempts to transform this guard into a [`MappedRwLockNotifyWriteGuard`].
+    ///
+    /// Returns `Err((self, error))` if `f` returns `Err`, giving the original guard
+    /// and the error back.
+    pub fn try_map_err<U, F, E>(
+        mut self,
+        f: F,
+    ) -> Result<MappedRwLockNotifyWriteGuard<'a, U>, (Self, E)>
+    where
+        F: FnOnce(&mut T) -> Result<&mut U, E>,
+    {
+        let guard = self.guard.take().unwrap();
+        let state = self.state;
+        forget(self);
+        match RwLockWriteGuard::try_map_or_err(guard, f) {
+            Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
+                guard: Some(map_guard),
+                state,
+            }),
+            Err((guard, err)) => Err((
+                Self {
+                    guard: Some(guard),
+                    state,
+                },
+                err,
+            )),
+        }
+    }
+}
+
+impl<'a, T> Deref for RwLockNotifyWriteGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
+    }
+}
+
+impl<'a, T> DerefMut for RwLockNotifyWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        DerefMut::deref_mut(self.guard.as_mut().unwrap())
+    }
+}
+
+impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        drop_write_guard(&mut self.guard, self.state)
+    }
+}
+
+/// RAII write guard produced by [`RwLockNotifyWriteGuard::map`] and related methods.
+///
+/// Provides exclusive write access to a subfield of the protected value via [`Deref`]
+/// and [`DerefMut`]. When dropped, releases the lock and flushes pending callbacks
+/// just like [`RwLockNotifyWriteGuard`].
+#[derive(Debug)]
+pub struct MappedRwLockNotifyWriteGuard<'a, T> {
+    guard: Option<MappedRwLockWriteGuard<'a, T>>,
+    state: &'a LockState,
+}
+
+impl<'a, T> Deref for MappedRwLockNotifyWriteGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        Deref::deref(self.guard.as_ref().unwrap())
+    }
+}
+
+impl<'a, T> DerefMut for MappedRwLockNotifyWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        DerefMut::deref_mut(self.guard.as_mut().unwrap())
+    }
+}
+
+impl<'a, T> Drop for MappedRwLockNotifyWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        drop_write_guard(&mut self.guard, self.state)
     }
 }
 
@@ -502,18 +547,6 @@ fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
     drain_and_run(state, callbacks);
 }
 
-impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
-    fn drop(&mut self) {
-        drop_write_guard(&mut self.guard, self.state)
-    }
-}
-
-impl<'a, T> Drop for MappedRwLockNotifyWriteGuard<'a, T> {
-    fn drop(&mut self) {
-        drop_write_guard(&mut self.guard, self.state)
-    }
-}
-
 fn drop_write_guard<G>(guard: &mut Option<G>, state: &LockState) {
     #[cfg(feature = "test-hooks")]
     hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
@@ -539,67 +572,34 @@ fn drop_write_guard<G>(guard: &mut Option<G>, state: &LockState) {
     drain_and_run(state, callbacks);
 }
 
-impl<T> From<T> for RwLockNotify<T> {
-    #[inline]
-    fn from(value: T) -> Self {
-        Self::new(value)
+/// Resets `dropping` to `false`, notifies waiters, then runs all collected
+/// callbacks, re-raising the first panic.
+///
+/// Callers must have already set `dropping = true` and drained the callback queue.
+fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
+    #[cfg(feature = "test-hooks")]
+    hooks::run(hooks::HookPoint::DrainAfterWriteLockRelease);
+
+    {
+        let mut inner = state.inner.lock();
+        inner.dropping = false;
+        state.not_dropping.notify_all();
     }
-}
 
-impl<T> From<RwLock<T>> for RwLockNotify<T> {
-    #[inline]
-    fn from(lock: RwLock<T>) -> Self {
-        Self::from_lock(lock)
-    }
-}
+    #[cfg(feature = "test-hooks")]
+    hooks::run(hooks::HookPoint::DrainBeforeCallbacks);
 
-impl<T> From<RwLockNotify<T>> for RwLock<T> {
-    #[inline]
-    fn from(lock: RwLockNotify<T>) -> Self {
-        lock.lock
-    }
-}
+    // Run every callback regardless of panics, then re-raise the first
+    // panic (if any) after all callbacks have had a chance to execute.
+    // `catch_unwind` is called unconditionally before `or` so that every
+    // callback runs even if an earlier one panicked (`or_else` would
+    // short-circuit and skip the remaining callbacks).
+    let first_panic = callbacks.into_iter().fold(None, |first, callback| {
+        let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
+        first.or(result)
+    });
 
-impl<'a, T> Deref for RwLockNotifyReadGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        Deref::deref(self.guard.as_ref().unwrap())
-    }
-}
-
-impl<'a, T> Deref for RwLockNotifyWriteGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        Deref::deref(self.guard.as_ref().unwrap())
-    }
-}
-
-impl<'a, T> DerefMut for RwLockNotifyWriteGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        DerefMut::deref_mut(self.guard.as_mut().unwrap())
-    }
-}
-
-impl<'a, T> Deref for MappedRwLockNotifyReadGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        Deref::deref(self.guard.as_ref().unwrap())
-    }
-}
-
-impl<'a, T> Deref for MappedRwLockNotifyWriteGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        Deref::deref(self.guard.as_ref().unwrap())
-    }
-}
-
-impl<'a, T> DerefMut for MappedRwLockNotifyWriteGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        DerefMut::deref_mut(self.guard.as_mut().unwrap())
+    if let Some(payload) = first_panic {
+        panic::resume_unwind(payload);
     }
 }

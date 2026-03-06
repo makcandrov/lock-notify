@@ -8,6 +8,7 @@ homepage = "https://github.com/makcandrov/lock-notify"
 description = "An `RwLock` wrapper that fires callbacks when a write guard is released."
 license = "MIT OR Apache-2.0"
 keywords = ["lock", "notify", "rwlock"]
+categories = ["concurrency", "data-structures"]
 
 [dependencies]
 parking_lot = "0.12"

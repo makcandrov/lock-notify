@@ -9,7 +9,6 @@ use std::{
     mem::{forget, take},
     ops::{Deref, DerefMut},
     panic::{self, AssertUnwindSafe},
-    sync::Arc,
 };
 
 use parking_lot::{
@@ -27,7 +26,7 @@ use parking_lot::{
 #[derive(Debug)]
 pub struct RwLockNotify<T> {
     lock: RwLock<T>,
-    state: Arc<LockState>,
+    state: LockState,
 }
 
 /// RAII read guard for [`RwLockNotify`].
@@ -43,7 +42,7 @@ pub struct RwLockNotify<T> {
 #[derive(Debug)]
 pub struct RwLockNotifyReadGuard<'a, T> {
     guard: Option<RwLockReadGuard<'a, T>>,
-    state: Arc<LockState>,
+    state: &'a LockState,
 }
 
 /// RAII write guard for [`RwLockNotify`].
@@ -59,7 +58,7 @@ pub struct RwLockNotifyReadGuard<'a, T> {
 #[derive(Debug)]
 pub struct RwLockNotifyWriteGuard<'a, T> {
     guard: Option<RwLockWriteGuard<'a, T>>,
-    state: Arc<LockState>,
+    state: &'a LockState,
 }
 
 #[derive(Default)]
@@ -117,7 +116,7 @@ impl<T> RwLockNotify<T> {
     pub fn from_lock(lock: RwLock<T>) -> Self {
         Self {
             lock,
-            state: Arc::new(LockState::default()),
+            state: LockState::default(),
         }
     }
 
@@ -142,7 +141,7 @@ impl<T> RwLockNotify<T> {
         self.state.inner.lock().readers += 1;
         RwLockNotifyReadGuard {
             guard: Some(guard),
-            state: self.state.clone(),
+            state: &self.state,
         }
     }
 
@@ -155,7 +154,7 @@ impl<T> RwLockNotify<T> {
         self.state.inner.lock().readers += 1;
         Some(RwLockNotifyReadGuard {
             guard: Some(guard),
-            state: self.state.clone(),
+            state: &self.state,
         })
     }
 
@@ -169,7 +168,7 @@ impl<T> RwLockNotify<T> {
     pub fn write(&self) -> RwLockNotifyWriteGuard<'_, T> {
         RwLockNotifyWriteGuard {
             guard: Some(self.lock.write()),
-            state: self.state.clone(),
+            state: &self.state,
         }
     }
 
@@ -183,7 +182,7 @@ impl<T> RwLockNotify<T> {
     pub fn try_write(&self) -> Option<RwLockNotifyWriteGuard<'_, T>> {
         self.lock.try_write().map(|guard| RwLockNotifyWriteGuard {
             guard: Some(guard),
-            state: self.state.clone(),
+            state: &self.state,
         })
     }
 
@@ -253,7 +252,7 @@ impl<T> RwLockNotify<T> {
             }
             Some(RwLockNotifyWriteGuard {
                 guard: Some(guard),
-                state: self.state.clone(),
+                state: &self.state,
             })
         } else {
             let mut inner = self.state.inner.lock();
@@ -275,7 +274,7 @@ impl<T> RwLockNotify<T> {
 #[derive(Debug)]
 pub struct MappedRwLockNotifyWriteGuard<'a, T> {
     guard: Option<MappedRwLockWriteGuard<'a, T>>,
-    state: Arc<LockState>,
+    state: &'a LockState,
 }
 
 impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
@@ -286,7 +285,7 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
         F: FnOnce(&mut T) -> &mut U,
     {
         let guard = self.guard.take().unwrap();
-        let state = self.state.clone();
+        let state = self.state;
         forget(self);
         let map_guard = RwLockWriteGuard::map(guard, f);
         MappedRwLockNotifyWriteGuard {
@@ -303,7 +302,7 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
         F: FnOnce(&mut T) -> Option<&mut U>,
     {
         let guard = self.guard.take().unwrap();
-        let state = self.state.clone();
+        let state = self.state;
         forget(self);
         match RwLockWriteGuard::try_map(guard, f) {
             Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
@@ -329,7 +328,7 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
         F: FnOnce(&mut T) -> Result<&mut U, E>,
     {
         let guard = self.guard.take().unwrap();
-        let state = self.state.clone();
+        let state = self.state;
         forget(self);
         match RwLockWriteGuard::try_map_or_err(guard, f) {
             Ok(map_guard) => Ok(MappedRwLockNotifyWriteGuard {
@@ -355,7 +354,7 @@ impl<'a, T> RwLockNotifyWriteGuard<'a, T> {
 #[derive(Debug)]
 pub struct MappedRwLockNotifyReadGuard<'a, T> {
     guard: Option<MappedRwLockReadGuard<'a, T>>,
-    state: Arc<LockState>,
+    state: &'a LockState,
 }
 
 impl<'a, T> RwLockNotifyReadGuard<'a, T> {
@@ -366,7 +365,7 @@ impl<'a, T> RwLockNotifyReadGuard<'a, T> {
         F: FnOnce(&T) -> &U,
     {
         let guard = self.guard.take().unwrap();
-        let state = self.state.clone();
+        let state = self.state;
         forget(self);
         let map_guard = RwLockReadGuard::map(guard, f);
         MappedRwLockNotifyReadGuard {
@@ -383,7 +382,7 @@ impl<'a, T> RwLockNotifyReadGuard<'a, T> {
         F: FnOnce(&T) -> Option<&U>,
     {
         let guard = self.guard.take().unwrap();
-        let state = self.state.clone();
+        let state = self.state;
         forget(self);
         match RwLockReadGuard::try_map(guard, f) {
             Ok(map_guard) => Ok(MappedRwLockNotifyReadGuard {
@@ -409,7 +408,7 @@ impl<'a, T> RwLockNotifyReadGuard<'a, T> {
         F: FnOnce(&T) -> Result<&U, E>,
     {
         let guard = self.guard.take().unwrap();
-        let state = self.state.clone();
+        let state = self.state;
         forget(self);
         match RwLockReadGuard::try_map_or_err(guard, f) {
             Ok(map_guard) => Ok(MappedRwLockNotifyReadGuard {
@@ -431,7 +430,7 @@ impl<'a, T> RwLockNotifyReadGuard<'a, T> {
 /// notifies waiters, then runs all collected callbacks, re-raising the first panic.
 ///
 /// Callers must have already set `dropping = true` and drained the callback queue.
-fn drain_and_run(state: &Arc<LockState>, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
+fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
     #[cfg(feature = "test-hooks")]
     hooks::run(hooks::HookPoint::DrainAfterWriteLockRelease);
 
@@ -461,17 +460,17 @@ fn drain_and_run(state: &Arc<LockState>, callbacks: Vec<Box<dyn FnOnce() + Send>
 
 impl<'a, T> Drop for RwLockNotifyReadGuard<'a, T> {
     fn drop(&mut self) {
-        drop_read_guard(&mut self.guard, &self.state)
+        drop_read_guard(&mut self.guard, self.state)
     }
 }
 
 impl<'a, T> Drop for MappedRwLockNotifyReadGuard<'a, T> {
     fn drop(&mut self) {
-        drop_read_guard(&mut self.guard, &self.state)
+        drop_read_guard(&mut self.guard, self.state)
     }
 }
 
-fn drop_read_guard<G>(guard: &mut Option<G>, state: &Arc<LockState>) {
+fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
     drop(guard.take());
 
     #[cfg(feature = "test-hooks")]
@@ -505,17 +504,17 @@ fn drop_read_guard<G>(guard: &mut Option<G>, state: &Arc<LockState>) {
 
 impl<'a, T> Drop for RwLockNotifyWriteGuard<'a, T> {
     fn drop(&mut self) {
-        drop_write_guard(&mut self.guard, &self.state)
+        drop_write_guard(&mut self.guard, self.state)
     }
 }
 
 impl<'a, T> Drop for MappedRwLockNotifyWriteGuard<'a, T> {
     fn drop(&mut self) {
-        drop_write_guard(&mut self.guard, &self.state)
+        drop_write_guard(&mut self.guard, self.state)
     }
 }
 
-fn drop_write_guard<G>(guard: &mut Option<G>, state: &Arc<LockState>) {
+fn drop_write_guard<G>(guard: &mut Option<G>, state: &LockState) {
     #[cfg(feature = "test-hooks")]
     hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
 

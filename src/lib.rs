@@ -1,8 +1,10 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![doc = include_str!("../README.md")]
 
-#[cfg(feature = "test-hooks")]
-pub mod hooks;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+use tests::hooks;
 
 use std::{
     fmt::Debug,
@@ -201,7 +203,7 @@ impl<T> RwLockNotify<T> {
         let mut inner = self.state.inner.lock();
 
         while inner.dropping {
-            #[cfg(feature = "test-hooks")]
+            #[cfg(test)]
             hooks::run(hooks::HookPoint::TryWriteOrWhileDropping);
 
             self.state.not_dropping.wait(&mut inner);
@@ -209,7 +211,7 @@ impl<T> RwLockNotify<T> {
         inner.locking += 1;
         drop(inner);
 
-        #[cfg(feature = "test-hooks")]
+        #[cfg(test)]
         hooks::run(hooks::HookPoint::TryWriteOrBeforeAcquire);
 
         if let Some(guard) = self.lock.try_write() {
@@ -518,7 +520,7 @@ impl<'a, T> Drop for MappedRwLockNotifyWriteGuard<'a, T> {
 fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
     drop(guard.take());
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(test)]
     hooks::run(hooks::HookPoint::ReadGuardAfterRelease);
 
     let callbacks = {
@@ -533,7 +535,7 @@ fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
         }
         inner.dropping = true;
 
-        #[cfg(feature = "test-hooks")]
+        #[cfg(test)]
         hooks::run(hooks::HookPoint::ReadGuardAfterSettingDropping);
 
         while inner.locking != 0 {
@@ -548,14 +550,14 @@ fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
 }
 
 fn drop_write_guard<G>(guard: &mut Option<G>, state: &LockState) {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(test)]
     hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
 
     let callbacks = {
         let mut inner = state.inner.lock();
         inner.dropping = true;
 
-        #[cfg(feature = "test-hooks")]
+        #[cfg(test)]
         hooks::run(hooks::HookPoint::WriteGuardAfterSettingDropping);
 
         // Sleep until all in-flight try_write_or calls have either
@@ -577,7 +579,7 @@ fn drop_write_guard<G>(guard: &mut Option<G>, state: &LockState) {
 ///
 /// Callers must have already set `dropping = true` and drained the callback queue.
 fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(test)]
     hooks::run(hooks::HookPoint::DrainAfterWriteLockRelease);
 
     {
@@ -586,7 +588,7 @@ fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
         state.not_dropping.notify_all();
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(test)]
     hooks::run(hooks::HookPoint::DrainBeforeCallbacks);
 
     // Run every callback regardless of panics, then re-raise the first

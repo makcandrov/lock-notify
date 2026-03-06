@@ -1,6 +1,6 @@
 //! Test-hook infrastructure for deterministic race-condition testing.
 //!
-//! Only compiled when the `test-hooks` Cargo feature is enabled.
+//! Only compiled when `cfg(test)` is active (i.e. when testing this crate).
 //!
 //! # Quick start
 //!
@@ -239,6 +239,7 @@ impl Gate {
     }
 
     /// Resets the gate to its initial state so it can be used again.
+    #[allow(unused)]
     pub fn reset(&self) {
         *self.state.lock().unwrap() = GateState::Idle;
     }

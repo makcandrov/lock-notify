@@ -1,10 +1,3 @@
-//! Deterministic race-condition tests using the `test-hooks` feature.
-//!
-//! Run with:
-//!   cargo test --features test-hooks --test race_tests
-
-#![cfg(feature = "test-hooks")]
-
 use std::{
     sync::{
         Arc, Mutex,
@@ -13,9 +6,9 @@ use std::{
     thread,
 };
 
-use lock_notify::{
+use crate::{
     RwLockNotify,
-    hooks::{self, Gate, HookPoint, TestGuard},
+    tests::hooks::{self, Gate, HookPoint, TestGuard},
 };
 
 // ─── write-guard drain races ──────────────────────────────────────────────────

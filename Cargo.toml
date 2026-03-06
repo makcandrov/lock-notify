@@ -12,8 +12,3 @@ categories = ["concurrency", "data-structures"]
 
 [dependencies]
 parking_lot = "0.12"
-
-[features]
-# Exposes injection points used by race-condition tests.
-# Run with: cargo test --features test-hooks --test race_tests
-test-hooks = []

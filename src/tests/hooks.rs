@@ -33,7 +33,7 @@ use std::{
 /// A point in the library code where a hook can be inserted.
 ///
 /// Every variant is reached with **no library locks held**, so hook functions
-/// (including [`Gate::wait`]) may safely call back into [`RwLockNotify`][crate::RwLockNotify].
+/// (including [`Gate::wait`]) may safely call back into [`RwLockBell`][crate::RwLockBell].
 ///
 /// **Exception:** avoid calling `try_write_or` from a hook placed at
 /// [`DrainAfterWriteLockRelease`][HookPoint::DrainAfterWriteLockRelease],
@@ -41,16 +41,16 @@ use std::{
 /// until the drain finishes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum HookPoint {
-    /// [`try_write_or`][crate::RwLockNotify::try_write_or]: the `locking`
+    /// [`try_write_or`][crate::RwLockBell::try_write_or]: the `locking`
     /// counter has been incremented and the state mutex released, but
     /// `try_write` has not yet been called.
     TryWriteOrBeforeAcquire,
 
-    /// `Drop for RwLockNotifyWriteGuard`: called before acquiring the state
+    /// `Drop for RwLockBellWriteGuard`: called before acquiring the state
     /// mutex to begin the drain sequence.
     WriteGuardBeforeDrop,
 
-    /// `Drop for RwLockNotifyReadGuard`: the underlying read lock has been
+    /// `Drop for RwLockBellReadGuard`: the underlying read lock has been
     /// released, but the state mutex has not yet been acquired to decrement
     /// the `readers` counter.
     ReadGuardAfterRelease,
@@ -63,17 +63,17 @@ pub enum HookPoint {
     /// `not_dropping` has been notified, but callbacks have not yet started.
     DrainBeforeCallbacks,
 
-    /// `Drop for RwLockNotifyWriteGuard`: `dropping` has just been set to
+    /// `Drop for RwLockBellWriteGuard`: `dropping` has just been set to
     /// `true`; the `locking_zero` wait has not yet started.
     ///
     /// **⚠ Called while holding the library's internal state mutex.**
-    /// The hook function **must not** block, call any [`RwLockNotify`][crate::RwLockNotify]
+    /// The hook function **must not** block, call any [`RwLockBell`][crate::RwLockBell]
     /// method, or acquire any mutex that could form a cycle with the state
     /// mutex.  Safe operations: [`Gate::signal`], atomic stores, non-blocking
     /// channel sends.
     WriteGuardAfterSettingDropping,
 
-    /// `Drop for RwLockNotifyReadGuard`: `dropping` has just been set to
+    /// `Drop for RwLockBellReadGuard`: `dropping` has just been set to
     /// `true` (only fires when this guard triggers the drain, i.e. when it is
     /// the last reader with pending callbacks); the `locking_zero` wait has
     /// not yet started.

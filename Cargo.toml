@@ -1,13 +1,13 @@
 [package]
-name = "lock-notify"
+name = "lockbell"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-repository = "https://github.com/makcandrov/lock-notify"
-homepage = "https://github.com/makcandrov/lock-notify"
-description = "An `RwLock` wrapper that fires callbacks when a write guard is released."
+repository = "https://github.com/makcandrov/lockbell"
+homepage = "https://github.com/makcandrov/lockbell"
+description = "An RwLock that rings back when contention clears."
 license = "MIT OR Apache-2.0"
-keywords = ["lock", "notify", "rwlock"]
+keywords = ["lock", "bell", "rwlock"]
 categories = ["concurrency", "data-structures"]
 
 [dependencies]

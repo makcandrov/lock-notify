@@ -1,23 +1,27 @@
-# lock-notify
+# lockbell
 
-[![Crates.io](https://img.shields.io/crates/v/lock-notify)](https://crates.io/crates/lock-notify)
-[![docs.rs](https://img.shields.io/docsrs/lock-notify)](https://docs.rs/lock-notify)
-[![License](https://img.shields.io/crates/l/lock-notify)](https://github.com/makcandrov/lock-notify#license)
+[![Crates.io](https://img.shields.io/crates/v/lockbell)](https://crates.io/crates/lockbell)
+[![docs.rs](https://img.shields.io/docsrs/lockbell)](https://docs.rs/lockbell)
+[![License](https://img.shields.io/crates/l/lockbell)](https://github.com/makcandrov/lockbell#license)
 
-An [`RwLock`] wrapper that fires callbacks when write access becomes available.
+An [`RwLock`] that rings back when contention clears.
 
 [`RwLock`]: https://docs.rs/parking_lot/latest/parking_lot/type.RwLock.html
 
 ## The problem
 
-`RwLock::try_write` returns `None` when the lock is contended — and gives you no way to know when it becomes free. You're left choosing between spinning, blocking, or silently dropping work.
+[`RwLock::try_write`] returns [`None`] when the lock is contended — and gives you no way to know when it becomes free. You're left choosing between spinning, blocking, or silently dropping work.
+
+[`RwLock::try_write`]: https://docs.rs/parking_lot/latest/parking_lot/type.RwLock.html#method.try_write
+
+[`None`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.None
 
 ## The solution
 
 ```rust
-use lock_notify::RwLockNotify;
+use lockbell::RwLockBell;
 
-let lock = RwLockNotify::new(0u32);
+let lock = RwLockBell::new(0u32);
 
 // Holds the lock — any concurrent try_write_or will register a callback
 let guard = lock.write();
@@ -36,8 +40,8 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 
 [`try_write_or_else`] is also available when constructing the callback is expensive and should only happen on contention.
 
-[`try_write_or`]: https://docs.rs/lock-notify/latest/lock_notify/struct.RwLockNotify.html#method.try_write_or
-[`try_write_or_else`]: https://docs.rs/lock-notify/latest/lock_notify/struct.RwLockNotify.html#method.try_write_or_else
+[`try_write_or`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or
+[`try_write_or_else`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or_else
 
 ## Callback semantics
 
@@ -50,7 +54,7 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 
 ```toml
 [dependencies]
-lock-notify = "0.1"
+lockbell = "0.1"
 ```
 
 ## Use cases

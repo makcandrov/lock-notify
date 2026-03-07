@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    RwLockNotify,
+    RwLockBell,
     tests::hooks::{self, Gate, HookPoint, TestGuard},
 };
 
@@ -28,7 +28,7 @@ use crate::{
 #[test]
 fn test_in_flight_try_write_or_collected_by_write_guard_drain() {
     let _g = TestGuard::acquire();
-    let lock = Arc::new(RwLockNotify::new(0u64));
+    let lock = Arc::new(RwLockBell::new(0u64));
     let called = Arc::new(AtomicBool::new(false));
 
     let gate = Gate::new();
@@ -79,7 +79,7 @@ fn test_in_flight_try_write_or_collected_by_write_guard_drain() {
 #[test]
 fn test_try_write_or_during_drain_eventually_proceeds() {
     let _g = TestGuard::acquire();
-    let lock = Arc::new(RwLockNotify::new(0u64));
+    let lock = Arc::new(RwLockBell::new(0u64));
 
     // Shared handle so main can join B after A completes.
     let b_handle: Arc<Mutex<Option<thread::JoinHandle<_>>>> = Arc::new(Mutex::new(None));
@@ -154,7 +154,7 @@ fn test_try_write_or_during_drain_eventually_proceeds() {
 #[test]
 fn test_in_flight_try_write_or_during_last_read_guard_drop() {
     let _g = TestGuard::acquire();
-    let lock = Arc::new(RwLockNotify::new(0u64));
+    let lock = Arc::new(RwLockBell::new(0u64));
     let called = Arc::new(AtomicU64::new(0));
 
     let gate = Gate::new();
@@ -213,7 +213,7 @@ fn test_in_flight_try_write_or_during_last_read_guard_drop() {
 #[test]
 fn test_read_guard_drop_atomicity() {
     let _g = TestGuard::acquire();
-    let lock = Arc::new(RwLockNotify::new(0u64));
+    let lock = Arc::new(RwLockBell::new(0u64));
     let fired = Arc::new(AtomicU64::new(0));
 
     let r = lock.read();
@@ -274,7 +274,7 @@ fn test_read_guard_drop_atomicity() {
 #[test]
 fn test_while_dropping_loop_is_entered() {
     let _g = TestGuard::acquire();
-    let lock = Arc::new(RwLockNotify::new(0u64));
+    let lock = Arc::new(RwLockBell::new(0u64));
 
     // gate_drain: pauses A's drain at DrainAfterWriteLockRelease.
     let gate_drain = Gate::new();
@@ -336,7 +336,7 @@ fn test_while_dropping_loop_is_entered() {
 }
 
 /// Verifies that the `while inner.locking != 0` loop body in
-/// `Drop for RwLockNotifyWriteGuard` is entered deterministically.
+/// `Drop for RwLockBellWriteGuard` is entered deterministically.
 ///
 /// Sequencing:
 /// 1. Thread B calls `try_write_or`, pauses at `TryWriteOrBeforeAcquire`
@@ -353,7 +353,7 @@ fn test_while_dropping_loop_is_entered() {
 #[test]
 fn test_write_guard_locking_zero_wait_is_entered() {
     let _g = TestGuard::acquire();
-    let lock = Arc::new(RwLockNotify::new(0u64));
+    let lock = Arc::new(RwLockBell::new(0u64));
     let called = Arc::new(AtomicBool::new(false));
 
     // gate_b: pauses B at TryWriteOrBeforeAcquire (locking=1).
@@ -411,7 +411,7 @@ fn test_write_guard_locking_zero_wait_is_entered() {
 #[test]
 fn test_callbacks_run_after_dropping_is_reset() {
     let _g = TestGuard::acquire();
-    let lock = Arc::new(RwLockNotify::new(0u64));
+    let lock = Arc::new(RwLockBell::new(0u64));
     let callback_ran = Arc::new(AtomicBool::new(false));
     let cr2 = callback_ran.clone();
 
